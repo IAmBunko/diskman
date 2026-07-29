@@ -1,44 +1,60 @@
 # DiskMan
 
-Terminal UI for Linux disk management: inspect physical drives, partitions, and volumes; mount/unmount; format with strong safety checks.
+Terminal UI for disk management on **Linux** and **macOS**: inspect physical drives, partitions, and volumes; mount/unmount; format with strong safety checks.
 
-**Location:** `~/Applications/DiskMan`
+**Location:** `~/Applications/DiskMan` (or clone from git)
 
 ## Features
 
-- **Device inventory** via `lsblk` (disks, partitions, labels, UUIDs, mountpoints, transport)
-- **Mount / unmount** via `udisksctl`
-- **Format** via `wipefs` + `mkfs.*` with:
-  - Hard blocks on system mounts (`/`, `/boot`, swap, etc.)
-  - Type-to-confirm (must type the device name, e.g. `sda2`)
-  - Filesystems: ext4, xfs, btrfs, f2fs, vfat, exfat (if the matching `mkfs` tool is installed)
+- **Device inventory**
+  - Linux: `lsblk` (+ `/proc/mounts`, `/proc/swaps`)
+  - macOS: `diskutil list/info` (plist)
+- **Mount / unmount**
+  - Linux: `udisksctl`
+  - macOS: `diskutil mount` / `diskutil unmount`
+- **Format** with hard safety checks and type-to-confirm
+  - Linux: `wipefs` + `mkfs.*` (ext4, xfs, btrfs, f2fs, vfat, exfat when tools exist)
+  - macOS: `diskutil eraseVolume` / `eraseDisk` (APFS, JHFS+, ExFAT, MS-DOS FAT32, Free Space)
 
 ## Requirements
 
-- Linux with `lsblk`, `udisksctl`, `wipefs`
-- Python 3.11+
-- For format: `sudo` and/or `pkexec`, plus desired `mkfs.*` tools
+| | Linux | macOS |
+|---|--------|--------|
+| OS tools | `lsblk`, `udisksctl`, `wipefs`, desired `mkfs.*` | `diskutil` (built-in) |
+| Python | 3.11+ | 3.11+ |
+| Privilege | `sudo -n` and/or `pkexec` | `sudo -n` and/or macOS admin dialog (`osascript`) |
+
+Windows is not supported yet (backend stub returns a clear error).
 
 ## Run
 
 ```bash
-~/Applications/DiskMan/run.sh
-```
-
-List devices without the TUI:
-
-```bash
-~/Applications/DiskMan/run.sh --list
+./run.sh
+# or
+./run.sh --list
+./run.sh --version
 ```
 
 Optional PATH shortcut:
 
 ```bash
-ln -sf ~/Applications/DiskMan/run.sh ~/.local/bin/diskman
+ln -sf /path/to/DiskMan/run.sh ~/.local/bin/diskman
 diskman
 ```
 
 `run.sh` creates a local `.venv` and installs Textual on first run if needed.
+
+### macOS notes
+
+- Use **Terminal**, **iTerm2**, or **Ghostty** (mouse right-click works in most modern emulators).
+- System volumes (`Macintosh HD`, Preboot, Recovery, VM, anything under `/System`) are blocked from format/unmount.
+- Prefer testing format on a disposable USB stick.
+- If elevation is needed, approve the macOS password dialog, or run `sudo -v` in another terminal first.
+
+### Linux notes
+
+- Install `udisks2` for mount/unmount without root in many desktop setups.
+- Format elevation uses non-interactive `sudo -n` or a polkit (`pkexec`) dialog so the TUI is not corrupted by a password prompt on stdin.
 
 ## Keyboard & mouse
 
@@ -52,25 +68,23 @@ diskman
 | Right-click | Context menu (Mount / Unmount / Format / Refresh) |
 | `q` | Quit |
 
-Unavailable actions in the context menu are disabled (same rules as the keyboard shortcuts). Right-click requires a terminal that forwards mouse events to the app (most modern emulators do when mouse mode is active).
-
 ## Safety
 
 Formatting is **destructive**. DiskMan will refuse to format:
 
-- Devices mounted at protected paths (`/`, `/boot`, `/home`, …)
-- Active swap
+- Devices mounted at protected paths (`/`, `/boot`, `/System`, `/Users`, …)
+- Active swap / macOS VM volumes
 - Virtual devices (`zram`, `loop`, …)
-- Whole disks when a child partition is mounted or protected
+- macOS system volume labels (Macintosh HD, Preboot, Recovery, …)
+- Whole disks when a child partition/volume is mounted or protected
 
-When format is allowed, you must type the exact device basename before the Format button enables. Prefer testing on disposable USB media only.
+When format is allowed, you must type the exact device basename (e.g. `sda2` or `disk4s1`) before the Format button enables.
 
 Privilege elevation uses **non-interactive** methods only so the TUI keeps the terminal:
 
-1. `sudo -n` (use cached credentials — run `sudo -v` in another terminal first if needed)
-2. `pkexec` (desktop polkit password dialog)
-
-Interactive `sudo` password prompts are intentionally disabled inside DiskMan; they steal stdin and would exit/corrupt the TUI.
+1. Try the operation as the current user (often enough on macOS for USB media)
+2. `sudo -n` (cached credentials — run `sudo -v` elsewhere if needed)
+3. Desktop dialog: **pkexec** (Linux) or **osascript administrator privileges** (macOS)
 
 ## Project layout
 
@@ -80,13 +94,19 @@ DiskMan/
 ├── requirements.txt
 ├── README.md
 └── src/diskman/
-    ├── app.py          # Textual app
-    ├── discover.py     # lsblk inventory
-    ├── safety.py       # mount/format policy
-    ├── actions.py      # mount / unmount / format
-    └── ui/             # detail pane, format modal
+    ├── app.py              # Textual app
+    ├── discover.py         # inventory facade
+    ├── actions.py          # mount/unmount/format facade
+    ├── safety.py           # mount/format policy (cross-platform)
+    ├── platform.py         # OS detection
+    ├── models.py
+    ├── backends/
+    │   ├── linux.py        # lsblk / udisksctl / wipefs+mkfs
+    │   ├── darwin.py       # diskutil
+    │   └── unsupported.py
+    └── ui/                 # detail pane, format modal, context menu
 ```
 
 ## Out of scope (v1)
 
-Partition create/delete/resize, LVM/RAID, SMART dashboards, NTFS format (`mkfs.ntfs` not required).
+Partition create/delete/resize, LVM/RAID, SMART dashboards, Windows backend, NTFS format on Linux (`mkfs.ntfs` not required).

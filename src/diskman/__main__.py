@@ -25,8 +25,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.version:
         from diskman import __version__
+        from diskman.platform import platform_label
 
-        print(f"DiskMan {__version__}")
+        print(f"DiskMan {__version__} ({platform_label()})")
         return 0
 
     if args.list:

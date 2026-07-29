@@ -15,6 +15,7 @@ from textual.widgets.tree import TreeNode
 from diskman.actions import mount_device, unmount_device
 from diskman.discover import list_devices
 from diskman.models import BlockDevice
+from diskman.platform import platform_label
 from diskman.safety import can_format, can_mount, can_unmount
 from diskman.ui.context_menu import DeviceContextMenu
 from diskman.ui.detail import DetailPane
@@ -179,7 +180,7 @@ class DiskManApp(App[None]):
 
             count = sum(len(d.walk()) for d in self.devices)
             self.set_status(
-                f"Loaded {len(self.devices)} disk(s), {count} device(s) · "
+                f"{platform_label()} · {len(self.devices)} disk(s), {count} device(s) · "
                 "r refresh · m mount · u unmount · f format · right-click menu · q quit"
             )
         except Exception as exc:  # noqa: BLE001

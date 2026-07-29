@@ -11,8 +11,9 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
 
-from diskman.actions import ActionResult, available_filesystems, format_device
+from diskman.actions import ActionResult, available_filesystems, format_device, privilege_hint
 from diskman.models import BlockDevice
+from diskman.platform import get_platform
 from diskman.safety import can_format, confirm_name_matches
 
 
@@ -83,7 +84,13 @@ class FormatModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         fs_options = available_filesystems()
         select_options = [(fs, fs) for fs in fs_options]
-        default_fs = "ext4" if "ext4" in fs_options else (fs_options[0] if fs_options else Select.BLANK)
+        preferred = "APFS" if get_platform() == "darwin" else "ext4"
+        if preferred in fs_options:
+            default_fs = preferred
+        elif fs_options:
+            default_fs = fs_options[0]
+        else:
+            default_fs = Select.BLANK
 
         check = can_format(self.device)
         summary_lines = [
@@ -148,7 +155,7 @@ class FormatModal(ModalScreen[bool]):
             )
         elif not available_filesystems():
             self.query_one("#format-log", Static).update(
-                "[red]No mkfs tools found on PATH[/red]"
+                "[red]No format tools available on this platform[/red]"
             )
 
     @on(Input.Changed, "#confirm-input")
@@ -200,7 +207,7 @@ class FormatModal(ModalScreen[bool]):
         self.query_one("#label-input", Input).disabled = True
         self.query_one("#fs-select", Select).disabled = True
         self.query_one("#format-log", Static).update(
-            "[yellow]Formatting… (auth via sudo -n or polkit dialog)[/yellow]"
+            f"[yellow]Formatting… ({privilege_hint()})[/yellow]"
         )
         self._run_format(fstype, label or None, confirm)
 

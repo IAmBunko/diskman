@@ -1,0 +1,368 @@
+"""Linux backend: lsblk inventory, udisksctl mount, wipefs + mkfs format."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+from collections import defaultdict
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Optional
+
+from diskman.backends.common import ActionResult, run_cmd, run_privileged_linux
+from diskman.models import BlockDevice
+from diskman.safety import can_format, can_mount, can_unmount
+
+LSBLK_COLUMNS = (
+    "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,"
+    "MODEL,SERIAL,TRAN,ROTA,RM,HOTPLUG,VENDOR,STATE,PKNAME,"
+    "PARTTYPE,PARTTYPENAME,PARTUUID,PTTYPE,FSAVAIL,FSUSE%,FSSIZE"
+)
+
+_SOURCE_DEV_RE = re.compile(r"^(/dev/\S+?)(?:\[.*\])?$")
+
+MkfsBuilder = Callable[[str, Optional[str]], list[str]]
+FILESYSTEMS: dict[str, tuple[str, MkfsBuilder]] = {}
+
+
+def _reg(fs: str, binary: str):
+    def decorator(fn: MkfsBuilder) -> MkfsBuilder:
+        FILESYSTEMS[fs] = (binary, fn)
+        return fn
+
+    return decorator
+
+
+@_reg("ext4", "mkfs.ext4")
+def _mkfs_ext4(path: str, label: Optional[str]) -> list[str]:
+    cmd = ["mkfs.ext4", "-F"]
+    if label:
+        cmd.extend(["-L", label[:16]])
+    cmd.append(path)
+    return cmd
+
+
+@_reg("xfs", "mkfs.xfs")
+def _mkfs_xfs(path: str, label: Optional[str]) -> list[str]:
+    cmd = ["mkfs.xfs", "-f"]
+    if label:
+        cmd.extend(["-L", label[:12]])
+    cmd.append(path)
+    return cmd
+
+
+@_reg("btrfs", "mkfs.btrfs")
+def _mkfs_btrfs(path: str, label: Optional[str]) -> list[str]:
+    cmd = ["mkfs.btrfs", "-f"]
+    if label:
+        cmd.extend(["-L", label[:255]])
+    cmd.append(path)
+    return cmd
+
+
+@_reg("f2fs", "mkfs.f2fs")
+def _mkfs_f2fs(path: str, label: Optional[str]) -> list[str]:
+    cmd = ["mkfs.f2fs", "-f"]
+    if label:
+        cmd.extend(["-l", label[:512]])
+    cmd.append(path)
+    return cmd
+
+
+@_reg("vfat", "mkfs.vfat")
+def _mkfs_vfat(path: str, label: Optional[str]) -> list[str]:
+    cmd = ["mkfs.vfat", "-F", "32"]
+    if label:
+        cmd.extend(["-n", label.upper()[:11]])
+    cmd.append(path)
+    return cmd
+
+
+@_reg("exfat", "mkfs.exfat")
+def _mkfs_exfat(path: str, label: Optional[str]) -> list[str]:
+    cmd = ["mkfs.exfat"]
+    if label:
+        cmd.extend(["-n", label[:15]])
+    cmd.append(path)
+    return cmd
+
+
+def _parse_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes"):
+        return True
+    if s in ("0", "false", "no"):
+        return False
+    return None
+
+
+def _from_lsblk_node(node: dict[str, Any]) -> BlockDevice:
+    path = node.get("path") or ""
+    name = node.get("name") or ""
+    if not path and name:
+        path = f"/dev/{name}"
+
+    children_raw = node.get("children") or []
+    children = [_from_lsblk_node(c) for c in children_raw]
+
+    return BlockDevice(
+        name=name,
+        path=path,
+        size=_parse_int(node.get("size")),
+        dev_type=(node.get("type") or "disk").lower(),
+        fstype=node.get("fstype") or None,
+        mountpoint=node.get("mountpoint") or None,
+        label=node.get("label") or None,
+        uuid=node.get("uuid") or None,
+        model=(node.get("model") or None),
+        serial=(node.get("serial") or None),
+        transport=node.get("tran") or None,
+        rotational=_parse_bool(node.get("rota")),
+        removable=_parse_bool(node.get("rm")),
+        hotplug=_parse_bool(node.get("hotplug")),
+        vendor=(node.get("vendor") or None),
+        state=node.get("state") or None,
+        pkname=node.get("pkname") or None,
+        parttype=node.get("parttype") or None,
+        parttypename=node.get("parttypename") or None,
+        partuuid=node.get("partuuid") or None,
+        pttype=node.get("pttype") or None,
+        fsavail=_parse_int(node.get("fsavail")),
+        fsuse_pct=node.get("fsuse%") or node.get("fsuse_pct") or None,
+        fssize=_parse_int(node.get("fssize")),
+        children=children,
+    )
+
+
+def _read_proc_mounts() -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = defaultdict(list)
+    try:
+        text = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        source, target = parts[0], parts[1]
+        if not source.startswith("/dev/"):
+            continue
+        m = _SOURCE_DEV_RE.match(source)
+        dev_path = m.group(1) if m else source
+        try:
+            dev_path = str(Path(dev_path).resolve())
+        except OSError:
+            pass
+        target = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), target)
+        if target not in mapping[dev_path]:
+            mapping[dev_path].append(target)
+    return mapping
+
+
+def _read_swaps() -> set[str]:
+    swaps: set[str] = set()
+    try:
+        lines = Path("/proc/swaps").read_text(encoding="utf-8", errors="replace").splitlines()[1:]
+    except OSError:
+        return swaps
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        path = parts[0]
+        if path.startswith("/dev/"):
+            try:
+                swaps.add(str(Path(path).resolve()))
+            except OSError:
+                swaps.add(path)
+    return swaps
+
+
+def _enrich_mounts(dev: BlockDevice, mounts: dict[str, list[str]], swaps: set[str]) -> None:
+    path = dev.path or ""
+    try:
+        resolved = str(Path(path).resolve()) if path else ""
+    except OSError:
+        resolved = path
+
+    found: list[str] = []
+    if resolved and resolved in mounts:
+        found.extend(mounts[resolved])
+    if path and path in mounts and path != resolved:
+        for mp in mounts[path]:
+            if mp not in found:
+                found.append(mp)
+
+    if dev.mountpoint and dev.mountpoint not in found:
+        found.insert(0, dev.mountpoint)
+
+    if resolved in swaps or path in swaps:
+        if "[SWAP]" not in found:
+            found.append("[SWAP]")
+        if not dev.fstype:
+            dev.fstype = "swap"
+
+    dev.mountpoints = found
+    if "/" in found:
+        dev.mountpoint = "/"
+    elif found and not dev.mountpoint:
+        dev.mountpoint = found[0]
+    elif found and dev.mountpoint not in found:
+        dev.mountpoint = found[0]
+
+    for child in dev.children:
+        _enrich_mounts(child, mounts, swaps)
+
+
+class LinuxBackend:
+    name = "linux"
+
+    def list_devices(self) -> list[BlockDevice]:
+        cmd = ["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS]
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("lsblk not found on PATH (Linux util-linux required)") from exc
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(f"lsblk failed: {err or exc.returncode}") from exc
+
+        data = json.loads(proc.stdout or "{}")
+        blockdevices = data.get("blockdevices") or []
+        devices = [_from_lsblk_node(n) for n in blockdevices]
+        mounts = _read_proc_mounts()
+        swaps = _read_swaps()
+        for d in devices:
+            _enrich_mounts(d, mounts, swaps)
+        return devices
+
+    def available_filesystems(self) -> list[str]:
+        out: list[str] = []
+        for fs, (binary, _) in FILESYSTEMS.items():
+            if shutil.which(binary):
+                out.append(fs)
+        return out
+
+    def mount(self, dev: BlockDevice) -> ActionResult:
+        check = can_mount(dev)
+        if not check.allowed:
+            return ActionResult(False, check.summary)
+
+        if not shutil.which("udisksctl"):
+            return ActionResult(
+                False,
+                "udisksctl not found (install udisks2). "
+                "On some systems: `sudo mount` is not used from the TUI.",
+            )
+
+        result = run_cmd(["udisksctl", "mount", "-b", dev.path])
+        if result.ok:
+            return ActionResult(
+                True,
+                result.stdout.strip() or result.message,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
+
+    def unmount(self, dev: BlockDevice) -> ActionResult:
+        check = can_unmount(dev)
+        if not check.allowed:
+            return ActionResult(False, check.summary)
+
+        if not shutil.which("udisksctl"):
+            return ActionResult(False, "udisksctl not found (install udisks2)")
+
+        result = run_cmd(["udisksctl", "unmount", "-b", dev.path])
+        if result.ok:
+            return ActionResult(
+                True,
+                result.stdout.strip() or f"Unmounted {dev.path}",
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
+
+    def format(
+        self,
+        dev: BlockDevice,
+        fstype: str,
+        label: Optional[str],
+        *,
+        confirm_name: str,
+    ) -> ActionResult:
+        if confirm_name.strip() != dev.name:
+            return ActionResult(False, f"Confirmation mismatch: type '{dev.name}' exactly")
+
+        check = can_format(dev)
+        if not check.allowed:
+            return ActionResult(False, check.summary)
+
+        if fstype not in FILESYSTEMS:
+            return ActionResult(False, f"Unsupported filesystem: {fstype}")
+
+        binary, builder = FILESYSTEMS[fstype]
+        if not shutil.which(binary):
+            return ActionResult(False, f"{binary} not found on PATH")
+
+        if not shutil.which("wipefs"):
+            return ActionResult(False, "wipefs not found on PATH")
+
+        wipe = run_privileged_linux(["wipefs", "-a", dev.path])
+        if not wipe.ok:
+            return ActionResult(
+                False,
+                f"wipefs failed: {wipe.message}",
+                stdout=wipe.stdout,
+                stderr=wipe.stderr,
+                returncode=wipe.returncode,
+            )
+
+        clean_label = label.strip() if label else None
+        mkfs_cmd = builder(dev.path, clean_label)
+        mkfs = run_privileged_linux(mkfs_cmd)
+        if not mkfs.ok:
+            return ActionResult(
+                False,
+                f"mkfs failed: {mkfs.message}",
+                stdout=(wipe.stdout or "") + (mkfs.stdout or ""),
+                stderr=(wipe.stderr or "") + (mkfs.stderr or ""),
+                returncode=mkfs.returncode,
+            )
+
+        msg = f"Formatted {dev.path} as {fstype}"
+        if clean_label:
+            msg += f' label="{clean_label}"'
+        return ActionResult(
+            True,
+            msg,
+            stdout=(wipe.stdout or "") + (mkfs.stdout or ""),
+            stderr=(wipe.stderr or "") + (mkfs.stderr or ""),
+        )
+
+    def privilege_hint(self) -> str:
+        return "auth via sudo -n or polkit dialog"

@@ -26,12 +26,12 @@ def human_size(num_bytes: Optional[int]) -> str:
 
 @dataclass
 class BlockDevice:
-    """A block device from lsblk (disk, partition, or other)."""
+    """A block device (disk, partition, volume, or other)."""
 
     name: str
     path: str
     size: Optional[int] = None
-    dev_type: str = "disk"  # disk | part | loop | rom | ...
+    dev_type: str = "disk"  # disk | part | loop | rom | container | ...
     fstype: Optional[str] = None
     mountpoint: Optional[str] = None
     label: Optional[str] = None
@@ -58,7 +58,7 @@ class BlockDevice:
 
     @property
     def is_disk(self) -> bool:
-        return self.dev_type == "disk"
+        return self.dev_type in ("disk", "container")
 
     @property
     def is_partition(self) -> bool:
@@ -81,14 +81,19 @@ class BlockDevice:
 
     @property
     def is_virtual(self) -> bool:
-        name = self.name or ""
-        return (
+        name = (self.name or "").lower()
+        if (
             name.startswith("zram")
             or name.startswith("loop")
             or name.startswith("ram")
             or name.startswith("dm-")
             or self.dev_type in ("loop", "rom")
-        )
+        ):
+            return True
+        # Linux nbd / md pseudo devices
+        if name.startswith("nbd") or name.startswith("md"):
+            return True
+        return False
 
     @property
     def size_human(self) -> str:
